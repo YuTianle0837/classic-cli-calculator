@@ -1,0 +1,166 @@
+
+name: Sync GitHub PR Stats to Notion
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 */6 * * *"
+
+permissions:
+  pull-requests: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Count PRs and update Notion
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_PAGE_ID: ${{ vars.NOTION_PAGE_ID }}
+
+        run: |
+          python3 - <<'PY'
+          import os
+          import json
+          from datetime import datetime, timezone
+          from urllib.request import Request, urlopen
+          from urllib.parse import urlencode
+
+          def api(url, headers, method="GET", body=None):
+              data = json.dumps(body).encode() if body is not None else None
+              req = Request(
+                  url, data=data, headers=headers, method=method
+              )
+              with urlopen(req, timeout=30) as response:
+                  return json.load(response)
+
+          repo = os.environ["REPOSITORY"]
+          page_id = os.environ["NOTION_PAGE_ID"]
+          token = os.environ["NOTION_TOKEN"]
+
+          gh_headers = {
+              "Authorization": "Bearer " + os.environ["GH_TOKEN"],
+              "Accept": "application/vnd.github+json",
+              "X-GitHub-Api-Version": "2022-11-28"
+          }
+
+          notion_headers = {
+              "Authorization": "Bearer " + token,
+              "Notion-Version": "2026-03-11",
+              "Content-Type": "application/json"
+          }
+
+          # 1. 获取仓库的全部历史 PR
+          prs = []
+          page = 1
+
+          while True:
+              url = (
+                  f"https://api.github.com/repos/{repo}/pulls"
+                  f"?state=all&per_page=100&page={page}"
+              )
+              batch = api(url, gh_headers)
+              prs.extend(batch)
+
+              if len(batch) < 100:
+                  break
+              page += 1
+
+          # 2. 分类统计
+          total = len(prs)
+          opened = sum(
+              p["state"] == "open" and not p["draft"]
+              for p in prs
+          )
+          draft = sum(
+              p["state"] == "open" and p["draft"]
+              for p in prs
+          )
+          merged = sum(bool(p["merged_at"]) for p in prs)
+          closed = sum(
+              p["state"] == "closed" and not p["merged_at"]
+              for p in prs
+          )
+
+          updated = datetime.now(timezone.utc).strftime(
+              "%Y-%m-%d %H:%M UTC"
+          )
+
+          # 3. 生成 Notion 统计内容
+          marker = "📊 GitHub PR 统计"
+          content = (
+              f"{marker}\n"
+              f"仓库：{repo}\n"
+              f"累计 PR：{total}\n"
+              f"Open：{opened}\n"
+              f"Draft：{draft}\n"
+              f"Merged：{merged}\n"
+              f"Closed（未合并）：{closed}\n"
+              f"更新时间：{updated}"
+          )
+
+          rich_text = [{
+              "type": "text",
+              "text": {"content": content}
+          }]
+
+          # 4. 找到已有的 Notion 统计区块
+          base = (
+              f"https://api.notion.com/v1/blocks/"
+              f"{page_id}/children"
+          )
+
+          cursor = None
+          target_id = None
+
+          while True:
+              params = {"page_size": 100}
+              if cursor:
+                  params["start_cursor"] = cursor
+
+              result = api(
+                  base + "?" + urlencode(params),
+                  notion_headers
+              )
+
+              for block in result["results"]:
+                  if block["type"] != "paragraph":
+                      continue
+
+                  text = "".join(
+                      item.get("plain_text", "")
+                      for item in block["paragraph"]["rich_text"]
+                  )
+
+                  if text.startswith(marker):
+                      target_id = block["id"]
+                      break
+
+              if target_id or not result["has_more"]:
+                  break
+
+              cursor = result["next_cursor"]
+
+          if not target_id:
+              raise RuntimeError(
+                  "找不到 Notion PR 统计区块，"
+                  "请检查 NOTION_PAGE_ID 和页面内容"
+              )
+
+          # 5. 原位置更新，不插入重复区块
+          api(
+              f"https://api.notion.com/v1/blocks/{target_id}",
+              notion_headers,
+              "PATCH",
+              {"paragraph": {"rich_text": rich_text}}
+          )
+
+          print(f"Successfully synced {total} PRs")
+          print(
+              f"Open={opened}, Draft={draft}, "
+              f"Merged={merged}, Closed={closed}"
+          )
+          PY
